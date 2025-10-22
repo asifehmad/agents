@@ -1655,13 +1655,14 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
     def run_repo_tests(self,file_paths:List[str])->str:
         '''
         Runs the tests for the repository. This tool will only run the tests for the files provided.
+        Now includes intelligent test failure analysis to help debug issues faster.
         Arguments:
             file_paths: path of the files to run the tests for.
         Output:
-            Returns the stdout/stderr from the executed files.
+            Returns the stdout/stderr from the executed files with analysis if tests fail.
         '''
         if not file_paths: return "No file paths provided to test."
-        
+
         if self.test_runner == "pytest":
             cmd = ["pytest"] + file_paths
         elif self.test_runner == "unittest":
@@ -1678,10 +1679,46 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             else:
                 args = [clean_filepath(f, os.getcwd(), self.test_runner) for f in file_paths]
             cmd = [self.test_runner] + args
-        
+
         logger.info(f"Running test command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        return (result.stdout or "") + (result.stderr or "")
+        test_output = (result.stdout or "") + (result.stderr or "")
+
+        # If tests failed, add intelligent analysis
+        if result.returncode != 0 and ("FAILED" in test_output or "ERROR" in test_output or "AssertionError" in test_output):
+            try:
+                logger.info("[TEST] Tests failed, performing intelligent analysis...")
+                analysis = analyze_test_failure(test_output)
+
+                analysis_summary = f"""
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 INTELLIGENT TEST FAILURE ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Failure Category: {analysis.get('failure_category', 'UNKNOWN')}
+🎯 Confidence: {analysis.get('confidence', 'unknown')}
+
+💡 Root Cause:
+{analysis.get('root_cause', 'Unknown')}
+
+📝 Expected vs Actual:
+{analysis.get('expected_vs_actual', 'N/A')}
+
+🔧 Fix Guidance:
+{chr(10).join(f"  {i+1}. {step}" for i, step in enumerate(analysis.get('fix_guidance', [])))}
+
+📍 Likely Location: {analysis.get('likely_location', 'unknown')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+                return test_output + analysis_summary
+
+            except Exception as e:
+                logger.error(f"[TEST] Failed to analyze test failure: {e}")
+                return test_output
+
+        return test_output
 
     @EnhancedToolManager.tool
     def run_code(self,content:str,file_path:str)->str:
@@ -1697,10 +1734,29 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         self.generated_test_files.append(file_path)
         return self._run_code(content, file_path)
     
+    def _validate_python_syntax(self, code: str, file_path: str) -> tuple[bool, str]:
+        """
+        Validates Python code syntax before saving.
+
+        Returns:
+            (is_valid, error_message)
+        """
+        try:
+            ast.parse(code)
+            return True, ""
+        except SyntaxError as e:
+            error_msg = f"Syntax error at line {e.lineno}: {e.msg}\n{e.text}"
+            logger.error(f"[VALIDATION] Syntax error in {file_path}: {error_msg}")
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Code validation error: {str(e)}"
+            logger.error(f"[VALIDATION] Error validating {file_path}: {error_msg}")
+            return False, error_msg
+
     @EnhancedToolManager.tool
     def apply_code_edit(self,file_path:str, search:str, replace:str)->str:
         '''
-        Performs targeted text replacement within source files.
+        Performs targeted text replacement within source files with automatic syntax validation.
         Arguments:
         file_path: target file for modification
         search: exact text pattern to locate and replace
@@ -1712,7 +1768,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL, "Error: You must get approval before applying edits. Call get_approval_for_solution tool first.")
         if not os.path.exists(file_path):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.FILE_NOT_FOUND, f"Error: file '{file_path}' does not exist.")
-        
+
         with open(file_path, 'r', encoding='utf-8') as f: original = f.read()
         
         if original.count(search) != 1:
@@ -2018,6 +2074,207 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
 
 
 
+def analyze_problem_requirements(problem_statement: str) -> dict:
+    """
+    Performs deep analysis of problem requirements to extract critical information.
+    This helps the agent understand EXACTLY what is expected.
+
+    Args:
+        problem_statement: The problem description
+
+    Returns:
+        Dictionary with extracted requirements
+    """
+    logger.info("[ANALYSIS] Starting deep problem analysis")
+
+    analysis_prompt = textwrap.dedent("""
+    You are an expert problem analyst. Analyze the problem statement and extract ALL critical requirements.
+    Your analysis will guide the solution implementation, so be PRECISE and THOROUGH.
+
+    Extract the following in a structured format:
+
+    1. **Expected Output Type** (CRITICAL):
+       - Analyze ALL examples to determine exact type (int, float, str, list, dict, etc.)
+       - Check decimal points in examples (8.00 → float, 800 → int)
+       - Identify units if any (dollars vs cents, meters vs cm, etc.)
+
+    2. **Input Constraints**:
+       - Types and ranges of inputs
+       - Edge cases mentioned (empty, None, zero, negative, etc.)
+
+    3. **Exact Error Messages** (if any):
+       - Extract EXACT error messages from problem statement
+       - Note which exceptions should be raised and when
+
+    4. **Core Requirements**:
+       - What calculations/logic are needed?
+       - What algorithms might work?
+       - What are the success criteria?
+
+    5. **Edge Cases to Handle**:
+       - Empty inputs
+       - Boundary values
+       - Special cases mentioned
+
+    6. **Example Analysis**:
+       - List all input→output examples
+       - What patterns do they show?
+       - What type/format is consistent across all?
+
+    Output your analysis as a JSON object with these keys:
+    {
+      "output_type": "int|float|str|list|dict|etc",
+      "output_format": "description of format",
+      "units": "description of units if applicable",
+      "error_messages": ["exact error message 1", "exact error message 2"],
+      "core_logic": "description of required logic",
+      "edge_cases": ["case 1", "case 2"],
+      "examples": [{"input": "...", "output": "...", "type": "..."}],
+      "critical_notes": ["note 1", "note 2"]
+    }
+
+    Only output the JSON, nothing else.
+    """)
+
+    messages = [
+        {"role": "system", "content": analysis_prompt},
+        {"role": "user", "content": f"Problem statement to analyze:\n\n{problem_statement}"}
+    ]
+
+    try:
+        response = EnhancedNetwork.make_request(
+            messages,
+            model=AgentConfig.DEEPSEEK_MODEL_NAME,  # Use DeepSeek for analysis
+            temperature=0.0
+        )
+
+        # Extract JSON from response
+        response = response.strip()
+        if response.startswith('```json'):
+            response = response[7:]
+        if response.startswith('```'):
+            response = response[3:]
+        if response.endswith('```'):
+            response = response[:-3]
+        response = response.strip()
+
+        requirements = json.loads(response)
+        logger.info(f"[ANALYSIS] Extracted requirements: {json.dumps(requirements, indent=2)}")
+        return requirements
+
+    except Exception as e:
+        logger.error(f"[ANALYSIS] Failed to parse requirements: {e}")
+        # Return empty dict if analysis fails
+        return {
+            "output_type": "unknown",
+            "output_format": "unknown",
+            "units": "",
+            "error_messages": [],
+            "core_logic": "",
+            "edge_cases": [],
+            "examples": [],
+            "critical_notes": []
+        }
+
+
+def analyze_test_failure(test_output: str, problem_statement: str = "") -> dict:
+    """
+    Analyzes test failure output to categorize the issue and provide actionable guidance.
+
+    Args:
+        test_output: The test failure output
+        problem_statement: Optional problem statement for context
+
+    Returns:
+        Dictionary with failure analysis
+    """
+    logger.info("[TEST_ANALYSIS] Analyzing test failures")
+
+    analysis_prompt = textwrap.dedent("""
+    You are an expert test failure analyst. Analyze the test output and categorize the failures.
+
+    **Analyze these aspects:**
+
+    1. **Failure Category** (Choose primary one):
+       - TYPE_MISMATCH: Wrong return type (int vs float, str vs list, etc.)
+       - VALUE_ERROR: Wrong calculated value but correct type
+       - ERROR_MESSAGE_MISMATCH: Wrong exception message text
+       - MISSING_ERROR: Should raise exception but doesn't
+       - WRONG_EXCEPTION: Raises wrong exception type
+       - LOGIC_ERROR: Algorithmic/logic bug
+       - EDGE_CASE_FAILURE: Fails on edge cases (empty, None, boundary)
+       - IMPORT_ERROR: Missing imports or module issues
+       - SYNTAX_ERROR: Code syntax problems
+       - OTHER: Other issue
+
+    2. **Root Cause Analysis**:
+       - What EXACTLY is wrong?
+       - Which line/function is the issue?
+       - What was expected vs actual?
+
+    3. **Type Analysis** (if TYPE_MISMATCH):
+       - Expected type: ?
+       - Actual type: ?
+       - Unit issue: (e.g., dollars vs cents, meters vs cm)?
+
+    4. **Actionable Fix Guidance**:
+       - Where to look (specific files/functions)?
+       - What to change?
+       - What to check?
+
+    Output as JSON:
+    {
+      "failure_category": "TYPE_MISMATCH|VALUE_ERROR|etc",
+      "root_cause": "detailed explanation",
+      "expected_vs_actual": "what was expected vs what was returned",
+      "type_issue": {"expected": "type", "actual": "type", "unit_conversion": "yes/no"},
+      "fix_guidance": ["step 1", "step 2", "step 3"],
+      "likely_location": "description of where bug likely is",
+      "confidence": "high|medium|low"
+    }
+
+    Only output JSON, nothing else.
+    """)
+
+    messages = [
+        {"role": "system", "content": analysis_prompt},
+        {"role": "user", "content": f"Test output to analyze:\n\n{test_output}\n\nProblem statement (for context):\n{problem_statement[:1000] if problem_statement else 'N/A'}"}
+    ]
+
+    try:
+        response = EnhancedNetwork.make_request(
+            messages,
+            model=AgentConfig.DEEPSEEK_MODEL_NAME,
+            temperature=0.0
+        )
+
+        # Extract JSON
+        response = response.strip()
+        if response.startswith('```json'):
+            response = response[7:]
+        if response.startswith('```'):
+            response = response[3:]
+        if response.endswith('```'):
+            response = response[:-3]
+        response = response.strip()
+
+        analysis = json.loads(response)
+        logger.info(f"[TEST_ANALYSIS] Category: {analysis.get('failure_category')}, Confidence: {analysis.get('confidence')}")
+        return analysis
+
+    except Exception as e:
+        logger.error(f"[TEST_ANALYSIS] Failed to analyze: {e}")
+        return {
+            "failure_category": "UNKNOWN",
+            "root_cause": "Could not analyze test failure",
+            "expected_vs_actual": "",
+            "type_issue": {},
+            "fix_guidance": ["Review test output manually", "Check for common errors"],
+            "likely_location": "unknown",
+            "confidence": "low"
+        }
+
+
 def check_problem_type(problem_statement: str) -> str:
     retry = 0
     while retry < 10:
@@ -2026,7 +2283,7 @@ def check_problem_type(problem_statement: str) -> str:
                 {"role": "system", "content": AgentConfig.PROBLEM_TYPE_CHECK_PROMPT},
                 {"role": "user", "content": f"{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}"}
             ]
-            
+
             response = EnhancedNetwork.make_request(messages, model=AgentConfig.QWEN_MODEL_NAME)
 
             if response not in [AgentConfig.PROBLEM_TYPE_CREATE, AgentConfig.PROBLEM_TYPE_FIX]:
@@ -2036,7 +2293,7 @@ def check_problem_type(problem_statement: str) -> str:
         except Exception as e:
             logger.error(f"Error: {e}")
             retry += 1
-        
+
         time.sleep(2)
 
     return response
@@ -2111,8 +2368,33 @@ def post_process_instruction(instruction: str) -> str:
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str, requirements: dict = None) -> str:
     retry = 0
+
+    # Add requirements analysis if available
+    requirements_text = ""
+    if requirements and requirements.get("output_type") != "unknown":
+        requirements_text = f"""
+
+**🔍 CRITICAL REQUIREMENTS EXTRACTED (Follow These EXACTLY):**
+
+- **Output Type**: {requirements.get('output_type', 'unknown')}
+- **Output Format**: {requirements.get('output_format', 'unknown')}
+- **Units**: {requirements.get('units', 'N/A')}
+- **Error Messages**: {json.dumps(requirements.get('error_messages', []))}
+  ⚠️ Use these EXACT error messages in your code
+- **Core Logic**: {requirements.get('core_logic', '')}
+- **Edge Cases to Handle**: {json.dumps(requirements.get('edge_cases', []))}
+- **Examples**: {json.dumps(requirements.get('examples', []))}
+- **Critical Notes**: {json.dumps(requirements.get('critical_notes', []))}
+
+⚠️ **MOST COMMON FAILURE**: Wrong output type!
+- If examples show decimals (8.00), return FLOAT not INT
+- If examples show integers (800), return INT not FLOAT
+- If problem mentions "dollars" check if examples use dollars (float) or cents (int)
+- Match the EXACT type from examples
+"""
+
     code_generation_messages = [
         {
             "role": "system",
@@ -2120,7 +2402,7 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
         },
         {
             "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+            "content": f"Problem Statement:\n{problem_statement}\n{requirements_text}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
         }
     ]
     while retry < 10:
@@ -2163,12 +2445,17 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
 
 def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
     retry = 0
+
+    # First, analyze problem requirements
+    logger.info("Step 1: Analyzing problem requirements")
+    requirements = analyze_problem_requirements(problem_statement)
+
     while retry < 10:
         try:
-            logger.info("Starting multi-step reasoning solution generation")
-            
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
-            
+            logger.info("Starting multi-step reasoning solution generation with requirements")
+
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton, requirements)
+
             if solution:
                 logger.info("Generated initial solution successfully using multi-step reasoning")
                 return solution
@@ -2216,8 +2503,31 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str
         return ""
     return ""
 
-def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
+def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_to_test: str, code_skeleton: str, requirements: dict = None) -> str:
     retry = 0
+
+    # Add requirements analysis if available
+    requirements_text = ""
+    if requirements and requirements.get("output_type") != "unknown":
+        requirements_text = f"""
+
+**🔍 CRITICAL TEST REQUIREMENTS (Match These EXACTLY):**
+
+- **Expected Output Type**: {requirements.get('output_type', 'unknown')}
+  ⚠️ Your assertions MUST expect this exact type!
+- **Output Format**: {requirements.get('output_format', 'unknown')}
+- **Units**: {requirements.get('units', 'N/A')}
+- **Expected Error Messages**: {json.dumps(requirements.get('error_messages', []))}
+  ⚠️ Use assertRaises and check for these EXACT error messages
+- **Examples to Test**: {json.dumps(requirements.get('examples', []))}
+  ⚠️ Include ALL these examples as test cases
+- **Edge Cases to Cover**: {json.dumps(requirements.get('edge_cases', []))}
+
+⚠️ **CRITICAL**: Match the output type from examples!
+- If problem shows `8.00`, write `assertEqual(func(), 8.00)` NOT `assertEqual(func(), 800)`
+- If problem shows `800`, write `assertEqual(func(), 800)` NOT `assertEqual(func(), 8.00)`
+"""
+
     test_generation_messages = [
         {
             "role": "system",
@@ -2225,7 +2535,7 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
         },
         {
             "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nFiles To Test: {files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"
+            "content": f"Problem Statement:\n{problem_statement}\n{requirements_text}\n\nFiles To Test: {files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"
         }
     ]
     while retry < 10:
@@ -2279,13 +2589,13 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
     
     return ""
 
-def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
+def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str, requirements: dict = None) -> str:
     retry = 0
     while retry < 10:
         try:
             logger.info("Starting test cases generation")
-            
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
+
+            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton, requirements)
             
             if testcases:
                 logger.info("Generated testcases successfully using multi-step reasoning")
@@ -2329,6 +2639,77 @@ def generate_test_files(problem_statement: str, files_to_test: str, code_skeleto
         logger.error("Failed to generate initial solution")
         return ""
     return ""
+
+def validate_solution_quality(code: str, problem_statement: str = "") -> dict:
+    """
+    Validates the quality of generated code before committing it.
+
+    Returns:
+        Dictionary with validation results
+    """
+    logger.info("[VALIDATION] Checking solution quality")
+
+    validation_prompt = textwrap.dedent("""
+    You are a code quality validator. Analyze the generated code for common issues.
+
+    **Check for:**
+
+    1. **Type Consistency**: Are return types consistent? Any int/float confusion?
+    2. **Error Handling**: Are exceptions handled? Are error messages present if needed?
+    3. **Edge Cases**: Does code handle empty inputs, None, boundary values?
+    4. **Logic Errors**: Any obvious algorithmic bugs?
+    5. **Completeness**: Are all required functions implemented?
+    6. **Code Quality**: Any obvious anti-patterns?
+
+    **Rate each aspect:**
+    - PASS: Looks good
+    - WARNING: Minor issues
+    - FAIL: Critical issues
+
+    Output as JSON:
+    {
+      "type_consistency": {"status": "PASS|WARNING|FAIL", "issues": ["issue1", ...]},
+      "error_handling": {"status": "PASS|WARNING|FAIL", "issues": []},
+      "edge_cases": {"status": "PASS|WARNING|FAIL", "issues": []},
+      "logic": {"status": "PASS|WARNING|FAIL", "issues": []},
+      "completeness": {"status": "PASS|WARNING|FAIL", "issues": []},
+      "overall_score": "PASS|WARNING|FAIL",
+      "recommendations": ["rec1", "rec2"]
+    }
+
+    Only output JSON.
+    """)
+
+    messages = [
+        {"role": "system", "content": validation_prompt},
+        {"role": "user", "content": f"Code to validate:\n\n{code}\n\nProblem statement:\n{problem_statement[:500]}"}
+    ]
+
+    try:
+        response = EnhancedNetwork.make_request(
+            messages,
+            model=AgentConfig.DEEPSEEK_MODEL_NAME,
+            temperature=0.0
+        )
+
+        # Extract JSON
+        response = response.strip()
+        if response.startswith('```json'):
+            response = response[7:]
+        if response.startswith('```'):
+            response = response[3:]
+        if response.endswith('```'):
+            response = response[:-3]
+        response = response.strip()
+
+        validation = json.loads(response)
+        logger.info(f"[VALIDATION] Overall score: {validation.get('overall_score', 'UNKNOWN')}")
+        return validation
+
+    except Exception as e:
+        logger.error(f"[VALIDATION] Failed to validate: {e}")
+        return {"overall_score": "WARNING", "recommendations": ["Manual review needed"]}
+
 
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     import os
@@ -2401,26 +2782,30 @@ def process_create_task(input_dict):
     print("│ 🆕 CREATE TASK WORKFLOW STARTING" + " "*44 + "│")
     print("└"+ "─"*78 + "┘")
     logger.info("[CREATE] Starting CREATE task workflow")
-    
+
     start_time = time.time()
     problem_statement = post_process_instruction(input_dict.get("problem_statement", ""))
     logger.info(f"[CREATE] Problem statement length: {len(problem_statement)} chars")
-    
+
+    logger.info("[CREATE] Step 0: Analyzing problem requirements")
+    requirements = analyze_problem_requirements(problem_statement)
+    logger.info(f"[CREATE] Requirements analysis complete")
+
     logger.info("[CREATE] Step 1: Generating code skeleton")
     code_skeleton = get_code_skeleton()
     logger.info(f"[CREATE] Code skeleton generated: {len(code_skeleton)} chars")
-    
+
     logger.info("[CREATE] Step 2: Generating initial solution")
     initial_solution = generate_initial_solution(problem_statement, code_skeleton)
     logger.info(f"[CREATE] Initial solution generated: {len(initial_solution)} chars")
-    
+
     logger.info("[CREATE] Step 3: Extracting and writing solution files")
     created_files = extract_and_write_files(initial_solution)
     logger.info(f"[CREATE] Created {len(created_files)} solution files")
     print(f"✅ Created {len(created_files)} solution files")
-    
-    logger.info("[CREATE] Step 4: Generating test files")
-    test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
+
+    logger.info("[CREATE] Step 4: Generating test files with requirements")
+    test_cases = generate_test_files(problem_statement, created_files, code_skeleton, requirements)
     logger.info(f"[CREATE] Test cases generated: {len(test_cases)} chars")
     
     logger.info("[CREATE] Step 5: Extracting and writing test files")
