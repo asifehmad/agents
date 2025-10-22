@@ -223,7 +223,7 @@ class AgentConfig:
     
     ## 💿 CRITICAL INSTRUCTIONS (Always Active):
     1. **Generic Solutions Only**: Write code that works for ANY input, not just the examples. No hardcoded values or problem-specific logic.
-       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a specific output (e.g., `if basket == [1,2,3]: return 42`)
+       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a specific output (e.g., `if input_data == [1,2,3]: return 42`)
        ✅ **REQUIRED**: Implement the actual algorithm that computes the result for ANY input
     2. **Type Safety**: Pay attention to return types (int vs float, list vs string). Match the expected output type from examples.
     3. **Edge Cases**: Handle empty inputs, boundary values, None/null, and type variations generically.
@@ -443,7 +443,7 @@ class AgentConfig:
     These instructions are programmed to help you operate effectively. They apply to EVERY task:
 
     1. **Generic Solutions Only**: Never hardcode problem-specific logic. Your solution must work for ANY similar problem, not just this one.
-       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a hardcoded output (e.g., `if basket == [1,2,3]: return 42`)
+       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a hardcoded output (e.g., `if input_data == [1,2,3]: return 42`)
        ✅ **REQUIRED**: Fix the underlying algorithm to compute the result correctly for ALL inputs
        🚫 **Anti-Cheating System Active**: Hardcoding detection is enabled and will reject your changes if detected
     2. **No Assumptions**: Don't assume file structures, function names, or patterns. Always explore and verify.
@@ -1293,7 +1293,7 @@ class EnhancedToolManager:
         import re
 
         # Pattern 1: Exact equality checks against complex data structures
-        # Examples: if basket == [1,2,3,4]: return 100
+        # Examples: if data == [1,2,3,4]: return 100
         #           if input == "specific string": return "result"
         patterns_complex = [
             r'if\s+\w+\s*==\s*\[.*?\]\s*:',  # if var == [list]:
@@ -1316,8 +1316,8 @@ class EnhancedToolManager:
 
         # Pattern 2: Multiple return statements with hardcoded numeric values after input checks
         # This catches patterns like:
-        #   if basket == [...]: return 68.00
-        #   if basket == [...]: return 114.00
+        #   if data == [...]: return 68.00
+        #   if data == [...]: return 114.00
         if_return_pattern = r'if\s+\w+\s*==.*?:\s*return\s+[\d.]+'
         if_returns = re.findall(if_return_pattern, content, re.DOTALL)
         if len(if_returns) >= 2:
