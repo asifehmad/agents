@@ -120,9 +120,9 @@ class AgentConfig:
 
     STUCK_DETECTION_PROMPT = textwrap.dedent("""
     🚨 **STUCK PATTERN DETECTED - NO PROGRESS** 🚨
-    
+
     You've been repeating similar actions without making progress. This means your current approach is NOT working.
-    
+
     **What to do NOW (5-Step Recovery):**
     1. **STOP** the current approach immediately
     2. **REFLECT**: Why isn't this working? What am I missing?
@@ -130,6 +130,7 @@ class AgentConfig:
     4. **ANALYZE** test failures systematically:
        - What's the EXACT difference between actual vs expected?
        - Is it a TYPE issue (int vs float, object vs value)?
+       - Is it a UNIT CONVERSION issue? (e.g., 145.6 vs 14560 = dollars vs cents!)
        - Is it an ERROR MESSAGE mismatch? (check problem statement for exact error text)
        - Is it a FORMAT issue (decimal places, list vs string)?
     5. **SWITCH STRATEGY** completely:
@@ -139,13 +140,23 @@ class AgentConfig:
        - If tests show wrong value → re-check your algorithm/calculation
        - If error message mismatch → use EXACT error message text from problem statement
        - If tests pass then fail → you're missing part of the requirements
-    
+
     **Common Stuck Patterns & Solutions:**
     - Same tool 3+ times → Try a DIFFERENT tool
     - Same search failing → Use BROADER or DIFFERENT keywords
     - Tests not improving → Read the TEST CODE itself, not just output
     - Same edit failing → The bug is in a DIFFERENT location
-    
+
+    **⚠️ CRITICAL WARNING - TEST EXPECTATIONS:**
+    - If you think test expectations are "wrong" or "impossible" → YOU ARE LIKELY MISUNDERSTANDING THE PROBLEM
+    - NEVER conclude that tests are wrong without first:
+      1. Re-reading the problem statement 3 times
+      2. Checking if you're testing against the RIGHT test file
+      3. Verifying you understand the output type/units correctly
+      4. Checking for unit conversions (cents vs dollars, etc.)
+    - The test expectations are ALMOST ALWAYS correct - the issue is in YOUR understanding or implementation
+    - **NEVER HARDCODE** specific test inputs/outputs - this is FORBIDDEN and will cause your solution to fail
+
     **DO NOT** repeat the same action. Try something COMPLETELY DIFFERENT.
     """)
 
@@ -212,10 +223,13 @@ class AgentConfig:
     
     ## 💿 CRITICAL INSTRUCTIONS (Always Active):
     1. **Generic Solutions Only**: Write code that works for ANY input, not just the examples. No hardcoded values or problem-specific logic.
+       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a specific output (e.g., `if input_data == [1,2,3]: return 42`)
+       ✅ **REQUIRED**: Implement the actual algorithm that computes the result for ANY input
     2. **Type Safety**: Pay attention to return types (int vs float, list vs string). Match the expected output type from examples.
     3. **Edge Cases**: Handle empty inputs, boundary values, None/null, and type variations generically.
     4. **Precision**: If examples show decimals (e.g., 51.2), return float. If examples show integers (e.g., 42), return int.
     5. **Units**: Pay attention to units (dollars vs cents, meters vs centimeters). Don't multiply/divide unnecessarily.
+       ⚠️ **COMMON ERROR**: Returning dollars when tests expect cents (or vice versa) - check if you need to multiply/divide by 100!
     6. **Algorithm Correctness**: Think through your algorithm before coding. Verify logic is sound.
 
     Strict Requirements:
@@ -427,11 +441,15 @@ class AgentConfig:
     
     ## 💿 CRITICAL INSTRUCTIONS (Always Active):
     These instructions are programmed to help you operate effectively. They apply to EVERY task:
-    
+
     1. **Generic Solutions Only**: Never hardcode problem-specific logic. Your solution must work for ANY similar problem, not just this one.
+       ⚠️ **ABSOLUTELY FORBIDDEN**: Checking if input equals a specific value and returning a hardcoded output (e.g., `if input_data == [1,2,3]: return 42`)
+       ✅ **REQUIRED**: Fix the underlying algorithm to compute the result correctly for ALL inputs
+       🚫 **Anti-Cheating System Active**: Hardcoding detection is enabled and will reject your changes if detected
     2. **No Assumptions**: Don't assume file structures, function names, or patterns. Always explore and verify.
     3. **Edge Cases**: Always consider and handle edge cases generically (empty inputs, boundary values, null/None, type variations).
     4. **Type Safety**: Ensure return types match expectations (int vs float, string vs list, etc.).
+       ⚠️ **COMMON ERROR**: Check for unit conversion issues (e.g., 145.6 vs 14560 = dollars vs cents!)
     5. **Algorithm Correctness**: Verify your logic is sound before implementing. Think through the algorithm step-by-step.
     6. **No Shortcuts**: Don't skip validation steps. Test thoroughly before calling finish().
     7. **Learn from Failures**: If a tool fails twice with the same approach, switch strategies immediately.
@@ -1260,9 +1278,66 @@ class EnhancedToolManager:
         """Public wrapper for syntax checking. Returns (is_error: bool, error_msg: str)."""
         return self._check_syntax_error(content, file_path)
 
+    def _detect_hardcoding(self, file_path: str, content: str) -> tuple[bool, str]:
+        """
+        Detects hardcoded solutions that check for specific inputs and return specific outputs.
+        This prevents agents from "cheating" by hardcoding test cases instead of solving generally.
+
+        Returns:
+            (is_hardcoded: bool, warning_message: str)
+        """
+        # Skip test files - they legitimately contain specific test data
+        if 'test' in file_path.lower() or file_path.startswith('.'):
+            return False, ""
+
+        import re
+
+        # Pattern 1: Exact equality checks against complex data structures
+        # Examples: if data == [1,2,3,4]: return 100
+        #           if input == "specific string": return "result"
+        patterns_complex = [
+            r'if\s+\w+\s*==\s*\[.*?\]\s*:',  # if var == [list]:
+            r'if\s+\w+\s*==\s*\(.*?\)\s*:',  # if var == (tuple):
+            r'if\s+\w+\s*==\s*\{.*?\}\s*:',  # if var == {dict}:
+        ]
+
+        for pattern in patterns_complex:
+            matches = re.findall(pattern, content, re.MULTILINE | re.DOTALL)
+            if matches:
+                # Check if there are multiple such patterns (strong indicator of hardcoding)
+                if len(matches) > 1:
+                    return True, f"Detected {len(matches)} hardcoded input checks in {file_path}:\n{matches[:3]}\n\nThis suggests hardcoding specific test cases instead of implementing a general algorithm."
+
+                # Even one case might be hardcoding - check the context
+                for match in matches:
+                    # If the comparison involves a complex structure (length > 20 chars), likely hardcoded
+                    if len(match) > 40:
+                        return True, f"Detected hardcoded input check with complex data structure in {file_path}:\n{match}\n\nThis appears to be hardcoding a specific test case. Implement a general solution instead."
+
+        # Pattern 2: Multiple return statements with hardcoded numeric values after input checks
+        # This catches patterns like:
+        #   if data == [...]: return 68.00
+        #   if data == [...]: return 114.00
+        if_return_pattern = r'if\s+\w+\s*==.*?:\s*return\s+[\d.]+'
+        if_returns = re.findall(if_return_pattern, content, re.DOTALL)
+        if len(if_returns) >= 2:
+            return True, f"Detected multiple ({len(if_returns)}) hardcoded input-output mappings in {file_path}.\n\nThis is a clear sign of hardcoding test cases instead of solving the problem generally."
+
+        return False, ""
+
     def _save(self,file_path: str, content: str)->str:
         is_syntax_error, error = self._check_syntax_error(content)
         if not is_syntax_error:
+            # Check for hardcoded solutions (anti-cheating detection)
+            hardcoding_detected, hardcoding_warning = self._detect_hardcoding(file_path, content)
+            if hardcoding_detected:
+                logger.warning(f"[ANTI-HARDCODE] Potential hardcoding detected in {file_path}")
+                logger.warning(f"[ANTI-HARDCODE] {hardcoding_warning}")
+                raise EnhancedToolManager.Error(
+                    EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL,
+                    f"❌ HARDCODING DETECTED - This violates the 'Generic Solutions Only' principle!\n\n{hardcoding_warning}\n\n🚫 Your solution must work for ANY input, not just specific test cases.\n💡 Instead of hardcoding specific inputs, fix the underlying algorithm."
+                )
+
             with open(file_path, "w") as file:
                 file.write(content)
             return f"File {file_path} saved successfully"
@@ -1690,12 +1765,23 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 logger.info("[TEST] Tests failed, performing intelligent analysis...")
                 analysis = analyze_test_failure(test_output)
 
+                # Check for unit conversion issues and add prominent warning
+                unit_warning = ""
+                numeric_analysis = analysis.get('numeric_analysis', {})
+                if numeric_analysis and numeric_analysis.get('likely_unit_issue') == 'yes':
+                    unit_warning = f"""
+⚠️⚠️⚠️ UNIT CONVERSION ISSUE DETECTED! ⚠️⚠️⚠️
+{numeric_analysis.get('exact_fix', 'Check if you need to multiply or divide by a conversion factor')}
+This is a COMMON error - check if your function returns the right units!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
                 analysis_summary = f"""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 INTELLIGENT TEST FAILURE ANALYSIS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+{unit_warning}
 📊 Failure Category: {analysis.get('failure_category', 'UNKNOWN')}
 🎯 Confidence: {analysis.get('confidence', 'unknown')}
 
@@ -2216,18 +2302,30 @@ def analyze_test_failure(test_output: str, problem_statement: str = "") -> dict:
        - Expected type: ?
        - Actual type: ?
        - Unit issue: (e.g., dollars vs cents, meters vs cm)?
+       - **CRITICAL CHECK**: Is actual exactly 100x smaller than expected? (e.g., 145.6 vs 14560 → cents vs dollars!)
+       - **CRITICAL CHECK**: Is actual exactly 100x larger than expected? (e.g., 14560 vs 145.6 → multiplied when should divide!)
 
-    4. **Actionable Fix Guidance**:
+    4. **Numeric Mismatch Analysis**:
+       - If expected and actual are both numbers:
+         • Ratio: actual / expected = ?
+         • Is ratio ≈ 0.01 (÷100 issue)?
+         • Is ratio ≈ 100 (×100 issue)?
+         • Is ratio ≈ 1000 (unit conversion issue)?
+         • Extract the EXACT conversion needed
+
+    5. **Actionable Fix Guidance**:
        - Where to look (specific files/functions)?
        - What to change?
        - What to check?
+       - If unit conversion detected: Provide EXACT fix (multiply by X or divide by Y)
 
     Output as JSON:
     {
       "failure_category": "TYPE_MISMATCH|VALUE_ERROR|etc",
       "root_cause": "detailed explanation",
       "expected_vs_actual": "what was expected vs what was returned",
-      "type_issue": {"expected": "type", "actual": "type", "unit_conversion": "yes/no"},
+      "type_issue": {"expected": "type", "actual": "type", "unit_conversion": "yes/no", "conversion_ratio": "number"},
+      "numeric_analysis": {"ratio": "number", "likely_unit_issue": "yes/no", "exact_fix": "multiply by X or divide by Y"},
       "fix_guidance": ["step 1", "step 2", "step 3"],
       "likely_location": "description of where bug likely is",
       "confidence": "high|medium|low"
