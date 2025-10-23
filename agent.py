@@ -24,6 +24,15 @@ from collections import Counter
 import math
 import hashlib
 
+# Import enhanced improvements
+from agent_improvements import (
+    GitCheckpointManager,
+    EnhancedTestComparator,
+    MultiSolutionGenerator,
+    TestRunnerDetector,
+    EnhancedSyntaxValidator
+)
+
 # ============================================================================
 # 1. CENTRALIZED CONFIGURATION
 # All settings, prompts, and constants are grouped here for easy management.
@@ -1864,7 +1873,95 @@ This is a COMMON error - check if your function returns the right units!
         new_content = original.replace(search, replace, 1)
         self._save(file_path, new_content) # _save includes syntax check
         return "ok, code edit applied successfully"
-    
+
+    @EnhancedToolManager.tool
+    def compare_test_results_before_after(self, test_files: List[str]) -> str:
+        '''
+        Compare test results before and after your changes to detect regressions.
+        This runs tests on the initial checkpoint and current state, then compares results.
+        USE THIS BEFORE calling finish() to ensure no passing tests were broken!
+
+        Arguments:
+            test_files: list of test file paths to run
+
+        Output:
+            Detailed comparison showing:
+            - New failures (REGRESSIONS - tests that passed before but fail now)
+            - New passes (tests that failed before but now pass)
+            - Still failing tests
+            - Still passing tests
+        '''
+        logger.info(f"Comparing test results for files: {test_files}")
+
+        if not hasattr(self, 'initial_checkpoint_created') or not self.initial_checkpoint_created:
+            return "Error: No initial checkpoint found. Cannot compare test results."
+
+        # Run tests on current state
+        logger.info("Running tests on current state...")
+        current_output = self._run_tests(test_files)
+
+        # Switch to initial checkpoint
+        logger.info("Switching to initial checkpoint...")
+        switch_result = GitCheckpointManager.switch_checkpoint(".", "agent_initial_state", save_current=True)
+        if switch_result['status'] != 'success':
+            return f"Error switching to initial checkpoint: {switch_result['message']}"
+
+        # Run tests on initial state
+        logger.info("Running tests on initial state...")
+        initial_output = self._run_tests(test_files)
+
+        # Restore current state
+        logger.info("Restoring current state...")
+        GitCheckpointManager.restore_stashed_changes(".", 0, remove_after_apply=True)
+
+        # Compare results
+        comparison = EnhancedTestComparator.compare_test_results(initial_output, current_output)
+
+        # Format output
+        result = "📊 TEST COMPARISON RESULTS:\n\n"
+
+        if comparison['new_failures']:
+            result += f"❌ NEW FAILURES (REGRESSIONS - {len(comparison['new_failures'])}):\n"
+            result += "These tests PASSED before but FAIL now - you MUST fix these!\n"
+            for test in comparison['new_failures']:
+                result += f"  - {test}\n"
+            result += "\n"
+
+            # Extract failure details
+            failures = EnhancedTestComparator.extract_failure_details(current_output)
+            if failures:
+                result += "Failure Details:\n"
+                for failure in failures[:3]:  # Show first 3 failures
+                    result += f"{failure}\n\n"
+
+        if comparison['new_passes']:
+            result += f"✅ NEW PASSES ({len(comparison['new_passes'])}):\n"
+            result += "These tests FAILED before but PASS now - good work!\n"
+            for test in comparison['new_passes']:
+                result += f"  - {test}\n"
+            result += "\n"
+
+        if comparison['still_failing']:
+            result += f"⚠️ STILL FAILING ({len(comparison['still_failing'])}):\n"
+            for test in comparison['still_failing'][:5]:  # Show first 5
+                result += f"  - {test}\n"
+            if len(comparison['still_failing']) > 5:
+                result += f"  ... and {len(comparison['still_failing']) - 5} more\n"
+            result += "\n"
+
+        if comparison['still_passing']:
+            result += f"✓ STILL PASSING ({len(comparison['still_passing'])}): Good!\n\n"
+
+        # Final verdict
+        if comparison['new_failures']:
+            result += "⛔ VERDICT: CANNOT FINISH - You introduced regressions! Fix the new failures first.\n"
+        elif comparison['new_passes'] or not comparison['still_failing']:
+            result += "✅ VERDICT: READY TO FINISH - No regressions detected!\n"
+        else:
+            result += "⚠️ VERDICT: Tests still failing, but no new regressions. Review if this is acceptable.\n"
+
+        return result
+
     @EnhancedToolManager.tool
     def finish(self,investigation_summary: str):
         '''
@@ -3190,7 +3287,8 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             "get_file_content", "save_file", "get_approval_for_solution",
             "get_functions", "get_classes", "search_in_all_files_content",
             "search_in_specified_file_v2", "start_over", "run_repo_tests",
-            "run_code", "apply_code_edit", "generate_test_function", "finish"
+            "run_code", "apply_code_edit", "generate_test_function",
+            "compare_test_results_before_after", "finish"
     ]
     
     tool_manager = FixTaskEnhancedToolManager(
@@ -3199,7 +3297,19 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         test_runner_mode=test_runner_mode
     )
     logger.info(f"[ITERATIVE] Initialized tool manager with {len(available_tools_list)} tools")
-    
+
+    # Create initial checkpoint for before/after test comparison
+    print("📸 Creating initial checkpoint...")
+    checkpoint_result = GitCheckpointManager.create_checkpoint(".", "agent_initial_state")
+    if checkpoint_result['status'] == 'success':
+        tool_manager.initial_checkpoint_created = True
+        logger.info(f"[CHECKPOINT] Created initial checkpoint: {checkpoint_result['message']}")
+        print(f"✅ Initial checkpoint created: {checkpoint_result['commit_hash'][:8]}")
+    else:
+        tool_manager.initial_checkpoint_created = False
+        logger.warning(f"[CHECKPOINT] Failed to create initial checkpoint: {checkpoint_result['message']}")
+        print(f"⚠️ Checkpoint creation failed (will continue without before/after comparison)")
+
     system_prompt = AgentConfig.FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(), format_prompt=AgentConfig.FORMAT_PROMPT_V0)
     instance_prompt = AgentConfig.FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
