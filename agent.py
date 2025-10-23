@@ -25,6 +25,435 @@ import math
 import hashlib
 
 # ============================================================================
+# GIT CHECKPOINT MANAGEMENT
+# ============================================================================
+
+class GitCheckpointManager:
+    """
+    Manages git checkpoints for tracking code state and comparing test results.
+    Key benefits:
+    - Save state before making changes
+    - Compare test results before/after changes
+    - Revert to known-good states
+    """
+
+    @staticmethod
+    def create_checkpoint(repo_path: str, checkpoint_name: str) -> dict:
+        """Create a checkpoint (git commit + tag) at current state."""
+        try:
+            if not os.path.exists(os.path.join(repo_path, ".git")):
+                return {"status": "error", "message": f"Not a git repository: {repo_path}"}
+
+            original_dir = os.getcwd()
+            os.chdir(repo_path)
+
+            # Check if checkpoint already exists
+            result = subprocess.run(["git", "tag", "-l", checkpoint_name], capture_output=True, text=True, check=False)
+            if result.stdout.strip():
+                os.chdir(original_dir)
+                return {"status": "error", "message": f"Checkpoint '{checkpoint_name}' already exists"}
+
+            # Stage all changes
+            subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+
+            # Check if there are changes to commit
+            status_result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
+
+            # Create commit if needed
+            if status_result.stdout.strip():
+                subprocess.run(["git", "commit", "-m", f"Checkpoint: {checkpoint_name}"], capture_output=True, text=True, check=True)
+
+            # Get current commit hash
+            hash_result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+            commit_hash = hash_result.stdout.strip()
+
+            # Create tag
+            subprocess.run(["git", "tag", checkpoint_name, commit_hash], check=True, capture_output=True)
+            os.chdir(original_dir)
+
+            return {"status": "success", "checkpoint_name": checkpoint_name, "commit_hash": commit_hash,
+                    "message": f"Checkpoint '{checkpoint_name}' created at {commit_hash[:8]}"}
+
+        except subprocess.CalledProcessError as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Git command failed: {e.stderr if e.stderr else str(e)}"}
+        except Exception as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @staticmethod
+    def switch_checkpoint(repo_path: str, checkpoint_name: str, save_current: bool = True) -> dict:
+        """Switch to a specific checkpoint, optionally stashing current changes."""
+        try:
+            if not os.path.exists(os.path.join(repo_path, ".git")):
+                return {"status": "error", "message": f"Not a git repository: {repo_path}"}
+
+            original_dir = os.getcwd()
+            os.chdir(repo_path)
+
+            # Check if checkpoint exists
+            tag_result = subprocess.run(["git", "tag", "-l", checkpoint_name], capture_output=True, text=True, check=False)
+            if not tag_result.stdout.strip():
+                os.chdir(original_dir)
+                return {"status": "error", "message": f"Checkpoint '{checkpoint_name}' not found"}
+
+            # Save current state if requested
+            stashed = False
+            if save_current:
+                status_result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
+                if status_result.stdout.strip():
+                    subprocess.run(["git", "stash", "push", "-u", "-m", f"Auto-stash before switching to {checkpoint_name}"],
+                                   capture_output=True, text=True, check=True)
+                    stashed = True
+
+            # Checkout the checkpoint
+            subprocess.run(["git", "checkout", checkpoint_name], capture_output=True, text=True, check=True)
+
+            # Get commit hash
+            hash_result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+            commit_hash = hash_result.stdout.strip()
+            os.chdir(original_dir)
+
+            return {"status": "success", "checkpoint_name": checkpoint_name, "commit_hash": commit_hash,
+                    "message": f"Switched to checkpoint '{checkpoint_name}' at {commit_hash[:8]}", "stashed": stashed}
+
+        except subprocess.CalledProcessError as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Git command failed: {e.stderr if e.stderr else str(e)}"}
+        except Exception as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @staticmethod
+    def restore_stashed_changes(repo_path: str, stash_index: int = 0, remove_after_apply: bool = True) -> dict:
+        """Restore previously stashed changes."""
+        try:
+            if not os.path.exists(os.path.join(repo_path, ".git")):
+                return {"status": "error", "message": f"Not a git repository: {repo_path}"}
+
+            original_dir = os.getcwd()
+            os.chdir(repo_path)
+
+            # Check if there are stashes
+            stash_list_result = subprocess.run(["git", "stash", "list"], capture_output=True, text=True, check=True)
+            if not stash_list_result.stdout.strip():
+                os.chdir(original_dir)
+                return {"status": "error", "message": "No stashed changes found"}
+
+            stash_count = len(stash_list_result.stdout.strip().split('\n'))
+            if stash_index >= stash_count:
+                os.chdir(original_dir)
+                return {"status": "error", "message": f"Stash index {stash_index} out of range. Only {stash_count} stash(es) available."}
+
+            # Apply or pop the stash
+            stash_ref = f"stash@{{{stash_index}}}"
+            if remove_after_apply:
+                command = ["git", "stash", "pop", stash_ref]
+                action = "popped"
+            else:
+                command = ["git", "stash", "apply", stash_ref]
+                action = "applied"
+
+            subprocess.run(command, capture_output=True, text=True, check=True)
+            os.chdir(original_dir)
+
+            return {"status": "success", "message": f"Successfully {action} stash@{{{stash_index}}}",
+                    "stash_index": stash_index, "removed": remove_after_apply}
+
+        except subprocess.CalledProcessError as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Git stash command failed: {e.stderr if e.stderr else str(e)}"}
+        except Exception as e:
+            if 'original_dir' in locals():
+                os.chdir(original_dir)
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+
+# ============================================================================
+# ENHANCED TEST COMPARISON
+# ============================================================================
+
+class EnhancedTestComparator:
+    """Compares test results before and after changes to detect regressions."""
+
+    @staticmethod
+    def parse_test_output(output: str) -> Dict[str, List[str]]:
+        """Parse test output to extract passed and failed tests."""
+        passed = []
+        failed = []
+
+        # Parse pytest output
+        if "PASSED" in output or "FAILED" in output:
+            for line in output.split('\n'):
+                if " PASSED" in line:
+                    match = re.search(r'(test_\w+|::test_\w+)', line)
+                    if match:
+                        passed.append(match.group(1))
+                elif " FAILED" in line or "FAIL:" in line or "ERROR:" in line:
+                    match = re.search(r'(test_\w+|::test_\w+)', line)
+                    if match:
+                        failed.append(match.group(1))
+
+        # Parse unittest output
+        elif "======================================================================" in output:
+            sections = output.split("======================================================================")
+            for section in sections:
+                if "FAIL:" in section or "ERROR:" in section:
+                    match = re.search(r'(test_\w+)', section)
+                    if match:
+                        failed.append(match.group(1))
+
+        return {"passed": passed, "failed": failed}
+
+    @staticmethod
+    def compare_test_results(before_output: str, after_output: str) -> Dict:
+        """Compare test results before and after changes."""
+        before = EnhancedTestComparator.parse_test_output(before_output)
+        after = EnhancedTestComparator.parse_test_output(after_output)
+
+        before_passed = set(before['passed'])
+        before_failed = set(before['failed'])
+        after_passed = set(after['passed'])
+        after_failed = set(after['failed'])
+
+        return {
+            "new_failures": list(before_passed & after_failed),  # REGRESSIONS!
+            "new_passes": list(before_failed & after_passed),    # Good!
+            "still_failing": list(before_failed & after_failed),
+            "still_passing": list(before_passed & after_passed)
+        }
+
+    @staticmethod
+    def extract_failure_details(output: str) -> List[str]:
+        """Extract detailed failure information from test output."""
+        failures = []
+        sections = output.split("======================================================================")
+        for section in sections:
+            if "FAIL:" in section or "ERROR:" in section:
+                failures.append(section.strip())
+        return failures
+
+
+# ============================================================================
+# MULTI-SOLUTION CONSENSUS APPROACH
+# ============================================================================
+
+class MultiSolutionGenerator:
+    """Generates multiple solutions and uses consensus/voting to select the best."""
+
+    @staticmethod
+    def extract_solution_code(response: str) -> str:
+        """Extract Python code from model response, handling markdown fences."""
+        if "```python" in response:
+            match = re.search(r'```python\n(.*?)```', response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        elif "```" in response:
+            match = re.search(r'```\n(.*?)```', response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return response.strip()
+
+    @staticmethod
+    def normalize_code(code: str) -> str:
+        """Normalize code for comparison (remove comments, extra whitespace)."""
+        code = re.sub(r'#[^\n]*', '', code)
+        code = '\n'.join(line for line in code.split('\n') if line.strip())
+        code = re.sub(r'\s+', ' ', code)
+        return code.strip()
+
+    @staticmethod
+    def find_consensus_solution(solutions: List[str]) -> Tuple[str, int, float]:
+        """Find the most common solution among generated solutions."""
+        if not solutions:
+            return None, 0, 0.0
+
+        normalized = [MultiSolutionGenerator.normalize_code(s) for s in solutions]
+        counter = Counter(normalized)
+        most_common_normalized, count = counter.most_common(1)[0]
+
+        for i, norm in enumerate(normalized):
+            if norm == most_common_normalized:
+                consensus_solution = solutions[i]
+                break
+
+        confidence = count / len(solutions)
+        logger.info(f"Consensus: {count}/{len(solutions)} solutions agree (confidence: {confidence:.1%})")
+        return consensus_solution, count, confidence
+
+    @staticmethod
+    def analyze_solution_diversity(solutions: List[str]) -> Dict:
+        """Analyze how diverse the generated solutions are."""
+        if not solutions:
+            return {"unique_count": 0, "total_count": 0, "diversity_score": 0.0, "most_common_count": 0}
+
+        normalized = [MultiSolutionGenerator.normalize_code(s) for s in solutions]
+        counter = Counter(normalized)
+
+        unique_count = len(counter)
+        total_count = len(solutions)
+        diversity_score = unique_count / total_count
+        most_common_count = counter.most_common(1)[0][1]
+
+        return {
+            "unique_count": unique_count,
+            "total_count": total_count,
+            "diversity_score": diversity_score,
+            "most_common_count": most_common_count
+        }
+
+
+# ============================================================================
+# TEST RUNNER AUTO-DETECTION
+# ============================================================================
+
+class TestRunnerDetector:
+    """Automatically detects test runner and mode from repository."""
+
+    @staticmethod
+    def find_test_files() -> List[str]:
+        """Find all test files in repository."""
+        test_files = []
+        for root, _, files in os.walk('.'):
+            if '.git' in root:
+                continue
+            for file in files:
+                if 'test_' in file and file.endswith('.py'):
+                    test_files.append(os.path.join(root, file))
+        return sorted(test_files, key=len)
+
+    @staticmethod
+    def count_test_cases(file_path: str) -> int:
+        """Count number of test functions in a file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            test_functions = re.findall(r'^\s*def\s+test_\w+', content, re.MULTILINE)
+            return len(test_functions)
+        except:
+            return 0
+
+    @staticmethod
+    def find_readme(start_path: str) -> Optional[str]:
+        """Find README file by traversing up from given path."""
+        current_dir = os.path.dirname(start_path)
+        while current_dir and current_dir != '/':
+            for readme_name in ['README.md', 'README.rst', 'README.txt', 'README']:
+                readme_path = os.path.join(current_dir, readme_name)
+                if os.path.exists(readme_path):
+                    return readme_path
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            current_dir = parent
+        return None
+
+    @staticmethod
+    def detect_from_readme(readme_path: str) -> Optional[str]:
+        """Detect test runner from README content."""
+        try:
+            with open(readme_path, 'r', encoding='utf-8') as f:
+                content = f.read().lower()
+            if 'pytest' in content:
+                return 'pytest'
+            elif 'unittest' in content and 'python -m unittest' in content:
+                return 'python -m unittest'
+            elif 'python test' in content:
+                match = re.search(r'python\s+([\w/]+\.py)', content)
+                if match:
+                    return match.group(1)
+        except:
+            pass
+        return None
+
+    @staticmethod
+    def detect_test_runner() -> Tuple[str, str]:
+        """Detect test runner and mode."""
+        test_files = TestRunnerDetector.find_test_files()
+        if not test_files:
+            logger.info("No test files found, defaulting to pytest")
+            return "pytest", "FILE"
+
+        test_file = None
+        for path in test_files:
+            if TestRunnerDetector.count_test_cases(path) > 5:
+                test_file = path
+                break
+
+        if not test_file:
+            test_file = test_files[0] if test_files else None
+
+        if not test_file:
+            return "pytest", "FILE"
+
+        readme_path = TestRunnerDetector.find_readme(test_file)
+        if readme_path:
+            runner = TestRunnerDetector.detect_from_readme(readme_path)
+            if runner:
+                logger.info(f"Detected test runner from README: {runner}")
+                if runner == "pytest" or runner.endswith(".py"):
+                    return runner, "FILE"
+                else:
+                    return runner, "MODULE"
+
+        logger.info("No test runner detected, defaulting to pytest")
+        return "pytest", "FILE"
+
+
+# ============================================================================
+# ENHANCED SYNTAX VALIDATION
+# ============================================================================
+
+class EnhancedSyntaxValidator:
+    """Enhanced syntax validation with detailed error reporting."""
+
+    @staticmethod
+    def validate_python_syntax(code: str, file_path: str = "<unknown>") -> Tuple[bool, Optional[str]]:
+        """Validate Python syntax with detailed error reporting."""
+        try:
+            tree = ast.parse(code, filename=file_path)
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = list(node.body)
+                    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+                        body = body[1:]
+
+                    if not body or (len(body) == 1 and isinstance(body[0], ast.Pass)):
+                        return False, f"Function '{node.name}' has empty body (line {node.lineno})"
+
+            return True, None
+
+        except SyntaxError as e:
+            error_msg = f"Syntax error at line {e.lineno}: {e.msg}"
+            if e.text:
+                error_msg += f"\n  {e.text.strip()}"
+            return False, error_msg
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+    @staticmethod
+    def check_for_hardcoding(code: str) -> Tuple[bool, Optional[str]]:
+        """Check if code contains hardcoded solutions (anti-cheating)."""
+        hardcode_patterns = [
+            r'if\s+\w+\s*==\s*\[.*?\]\s*:\s*return\s+\d+',
+            r'if\s+\w+\s*==\s*\{.*?\}\s*:\s*return\s+\d+',
+            r'if\s+\w+\s*==\s*["\'].*?["\']\s*:\s*return',
+        ]
+
+        for pattern in hardcode_patterns:
+            if re.search(pattern, code):
+                return True, "⚠️ Detected potential hardcoded solution. Use generic algorithms instead."
+
+        return False, None
+
+
+# ============================================================================
 # 1. CENTRALIZED CONFIGURATION
 # All settings, prompts, and constants are grouped here for easy management.
 # ============================================================================
@@ -1864,7 +2293,95 @@ This is a COMMON error - check if your function returns the right units!
         new_content = original.replace(search, replace, 1)
         self._save(file_path, new_content) # _save includes syntax check
         return "ok, code edit applied successfully"
-    
+
+    @EnhancedToolManager.tool
+    def compare_test_results_before_after(self, test_files: List[str]) -> str:
+        '''
+        Compare test results before and after your changes to detect regressions.
+        This runs tests on the initial checkpoint and current state, then compares results.
+        USE THIS BEFORE calling finish() to ensure no passing tests were broken!
+
+        Arguments:
+            test_files: list of test file paths to run
+
+        Output:
+            Detailed comparison showing:
+            - New failures (REGRESSIONS - tests that passed before but fail now)
+            - New passes (tests that failed before but now pass)
+            - Still failing tests
+            - Still passing tests
+        '''
+        logger.info(f"Comparing test results for files: {test_files}")
+
+        if not hasattr(self, 'initial_checkpoint_created') or not self.initial_checkpoint_created:
+            return "Error: No initial checkpoint found. Cannot compare test results."
+
+        # Run tests on current state
+        logger.info("Running tests on current state...")
+        current_output = self._run_tests(test_files)
+
+        # Switch to initial checkpoint
+        logger.info("Switching to initial checkpoint...")
+        switch_result = GitCheckpointManager.switch_checkpoint(".", "agent_initial_state", save_current=True)
+        if switch_result['status'] != 'success':
+            return f"Error switching to initial checkpoint: {switch_result['message']}"
+
+        # Run tests on initial state
+        logger.info("Running tests on initial state...")
+        initial_output = self._run_tests(test_files)
+
+        # Restore current state
+        logger.info("Restoring current state...")
+        GitCheckpointManager.restore_stashed_changes(".", 0, remove_after_apply=True)
+
+        # Compare results
+        comparison = EnhancedTestComparator.compare_test_results(initial_output, current_output)
+
+        # Format output
+        result = "📊 TEST COMPARISON RESULTS:\n\n"
+
+        if comparison['new_failures']:
+            result += f"❌ NEW FAILURES (REGRESSIONS - {len(comparison['new_failures'])}):\n"
+            result += "These tests PASSED before but FAIL now - you MUST fix these!\n"
+            for test in comparison['new_failures']:
+                result += f"  - {test}\n"
+            result += "\n"
+
+            # Extract failure details
+            failures = EnhancedTestComparator.extract_failure_details(current_output)
+            if failures:
+                result += "Failure Details:\n"
+                for failure in failures[:3]:  # Show first 3 failures
+                    result += f"{failure}\n\n"
+
+        if comparison['new_passes']:
+            result += f"✅ NEW PASSES ({len(comparison['new_passes'])}):\n"
+            result += "These tests FAILED before but PASS now - good work!\n"
+            for test in comparison['new_passes']:
+                result += f"  - {test}\n"
+            result += "\n"
+
+        if comparison['still_failing']:
+            result += f"⚠️ STILL FAILING ({len(comparison['still_failing'])}):\n"
+            for test in comparison['still_failing'][:5]:  # Show first 5
+                result += f"  - {test}\n"
+            if len(comparison['still_failing']) > 5:
+                result += f"  ... and {len(comparison['still_failing']) - 5} more\n"
+            result += "\n"
+
+        if comparison['still_passing']:
+            result += f"✓ STILL PASSING ({len(comparison['still_passing'])}): Good!\n\n"
+
+        # Final verdict
+        if comparison['new_failures']:
+            result += "⛔ VERDICT: CANNOT FINISH - You introduced regressions! Fix the new failures first.\n"
+        elif comparison['new_passes'] or not comparison['still_failing']:
+            result += "✅ VERDICT: READY TO FINISH - No regressions detected!\n"
+        else:
+            result += "⚠️ VERDICT: Tests still failing, but no new regressions. Review if this is acceptable.\n"
+
+        return result
+
     @EnhancedToolManager.tool
     def finish(self,investigation_summary: str):
         '''
@@ -3190,7 +3707,8 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             "get_file_content", "save_file", "get_approval_for_solution",
             "get_functions", "get_classes", "search_in_all_files_content",
             "search_in_specified_file_v2", "start_over", "run_repo_tests",
-            "run_code", "apply_code_edit", "generate_test_function", "finish"
+            "run_code", "apply_code_edit", "generate_test_function",
+            "compare_test_results_before_after", "finish"
     ]
     
     tool_manager = FixTaskEnhancedToolManager(
@@ -3199,7 +3717,19 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         test_runner_mode=test_runner_mode
     )
     logger.info(f"[ITERATIVE] Initialized tool manager with {len(available_tools_list)} tools")
-    
+
+    # Create initial checkpoint for before/after test comparison
+    print("📸 Creating initial checkpoint...")
+    checkpoint_result = GitCheckpointManager.create_checkpoint(".", "agent_initial_state")
+    if checkpoint_result['status'] == 'success':
+        tool_manager.initial_checkpoint_created = True
+        logger.info(f"[CHECKPOINT] Created initial checkpoint: {checkpoint_result['message']}")
+        print(f"✅ Initial checkpoint created: {checkpoint_result['commit_hash'][:8]}")
+    else:
+        tool_manager.initial_checkpoint_created = False
+        logger.warning(f"[CHECKPOINT] Failed to create initial checkpoint: {checkpoint_result['message']}")
+        print(f"⚠️ Checkpoint creation failed (will continue without before/after comparison)")
+
     system_prompt = AgentConfig.FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(), format_prompt=AgentConfig.FORMAT_PROMPT_V0)
     instance_prompt = AgentConfig.FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
